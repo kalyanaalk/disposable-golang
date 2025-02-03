@@ -50,21 +50,3 @@ services:
     restart: always
     ports:
       - "27017:27017"
-
-  # app:
-  #   build: .
-  #   container_name: probes-disposable
-  #   restart: always
-  #   depends_on:
-  #     - kafka
-  #     - redis
-  #     - postgres
-  #     - mongo
-  #   environment:
-  #     REDIS_ADDR: "redis:6379"
-  #     POSTGRES_DSN: "host=postgres user=user password=password dbname=mydb sslmode=disable"
-  #     MONGO_URI: "mongodb://mongo:27017"
-  #     KAFKA_BROKER: "kafka:9092"
-  #   ports:
-  #     - "8080:8080"
-    # command: ["./probes-disposable"]
