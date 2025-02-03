@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper-disposable
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-disposable
+    restart: always
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+
+  redis:
+    image: redis:latest
+    container_name: redis-disposable
+    restart: always
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres-disposable
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydb
+    ports:
+      - "5432:5432"
+
+  mongo:
+    image: mongo:latest
+    container_name: mongo--disposable
+    restart: always
+    ports:
+      - "27017:27017"
+
+  # app:
+  #   build: .
+  #   container_name: probes-disposable
+  #   restart: always
+  #   depends_on:
+  #     - kafka
+  #     - redis
+  #     - postgres
+  #     - mongo
+  #   environment:
+  #     REDIS_ADDR: "redis:6379"
+  #     POSTGRES_DSN: "host=postgres user=user password=password dbname=mydb sslmode=disable"
+  #     MONGO_URI: "mongodb://mongo:27017"
+  #     KAFKA_BROKER: "kafka:9092"
+  #   ports:
+  #     - "8080:8080"
+    # command: ["./probes-disposable"]

@@ -47,11 +47,39 @@ func checkKafka() error {
 	return nil
 }
 
+func waitForDependencies(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		log.Println("Checking dependencies...")
+
+		if err := checkRedis(ctx); err != nil {
+			log.Println("Redis not ready:", err)
+			// } else if err := checkPostgres(ctx); err != nil {
+			// 	log.Println("PostgreSQL not ready:", err)
+		} else if err := checkMongo(ctx); err != nil {
+			log.Println("MongoDB not ready:", err)
+		} else if err := checkKafka(); err != nil {
+			log.Println("Kafka not ready:", err)
+		} else {
+			log.Println("All dependencies are ready!")
+			return nil
+		}
+
+		log.Println("Retrying in 3 seconds...")
+		time.Sleep(3 * time.Second)
+	}
+
+	return fmt.Errorf("startup dependencies not ready, exiting")
+}
+
+// Liveness Probe
 func livenessHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
+// Readiness Probe
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -60,10 +88,10 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	// if err := checkPostgres(ctx); err != nil {
-	// 	http.Error(w, "Postgres unavailable", http.StatusServiceUnavailable)
-	// 	return
-	// }
+	if err := checkPostgres(ctx); err != nil {
+		http.Error(w, "Postgres unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err := checkMongo(ctx); err != nil {
 		http.Error(w, "MongoDB unavailable", http.StatusServiceUnavailable)
 		return
@@ -77,6 +105,7 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+// Startup Probe
 func startupHandler(w http.ResponseWriter, r *http.Request) {
 	if !startupDone {
 		http.Error(w, "Starting up", http.StatusServiceUnavailable)
@@ -94,12 +123,14 @@ func main() {
 	mongoClient, _ = mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
 	kafkaProducer, _ = kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "localhost:9092"})
 
-	// Startup probe delay
-	time.Sleep(5 * time.Second)
+	if err := waitForDependencies(ctx, 30*time.Second); err != nil {
+		log.Fatalf("Startup failed: %v", err)
+	}
+
 	startupDone = true
 
-	http.HandleFunc("/healthz", livenessHandler)
-	http.HandleFunc("/ready", readinessHandler)
+	http.HandleFunc("/health-check", livenessHandler)
+	http.HandleFunc("/readiness", readinessHandler)
 	http.HandleFunc("/startup", startupHandler)
 
 	server := &http.Server{Addr: ":8080"}
@@ -110,36 +141,23 @@ func main() {
 		}
 	}()
 
-	// Graceful Shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 
-	log.Println("Shutting down...")
+	log.Println("Shutting down gracefully...")
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// Try shutting down the services
-	go func() {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Fatalf("Server shutdown failed: %v", err)
-		}
-	}()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
 
 	redisClient.Close()
 	postgresDB.Close()
 	mongoClient.Disconnect(shutdownCtx)
 	kafkaProducer.Close()
-
-	select {
-	case <-shutdownCtx.Done():
-		if shutdownCtx.Err() == context.DeadlineExceeded {
-			log.Fatalln("timeout exceeded, forcing shutdown")
-		}
-
-		os.Exit(0)
-	}
 
 	log.Println("Shutdown complete")
 }
