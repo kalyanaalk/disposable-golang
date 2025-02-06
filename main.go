@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/go-redis/redis/v8"
 	_ "github.com/lib/pq"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -24,19 +26,50 @@ var (
 	mongoClient   *mongo.Client
 	kafkaProducer *kafka.Producer
 	startupDone   bool
+	shutdownFlag  bool
+	wg            sync.WaitGroup
+	mutex         sync.Mutex
 )
 
+func longRunningTask(ctx context.Context, service string, duration time.Duration) {
+	log.Printf("Processing %s task (%v)...", service, duration)
+	wg.Add(1)
+	defer wg.Done()
+	time.Sleep(duration)
+	log.Printf("%s processing done.", service)
+}
+
+func requestHandler(service string, duration time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		if shutdownFlag {
+			mutex.Unlock()
+			http.Error(w, "Service shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		mutex.Unlock()
+
+		ctx := r.Context()
+		longRunningTask(ctx, service, duration)
+		w.Write([]byte(fmt.Sprintf("%s test completed", service)))
+	}
+}
+
 func checkRedis(ctx context.Context) error {
-	_, err := redisClient.Ping(ctx).Result()
+	_, err := redisClient.Do(ctx, "TIME").Result()
 	return err
 }
 
 func checkPostgres(ctx context.Context) error {
-	return postgresDB.PingContext(ctx)
+	var currentTime time.Time
+	err := postgresDB.QueryRowContext(ctx, "SELECT NOW()").Scan(&currentTime)
+	return err
 }
 
 func checkMongo(ctx context.Context) error {
-	return mongoClient.Ping(ctx, nil)
+	var result bson.M
+	err := mongoClient.Database("admin").RunCommand(ctx, bson.D{{"serverStatus", 1}}).Decode(&result)
+	return err
 }
 
 func checkKafka() error {
@@ -117,7 +150,8 @@ func startupHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background()) // No timeout, only cancel when all done
+	defer cancel()
 
 	redisClient = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	postgresDB, _ = sql.Open("postgres", "postgres://user:password@localhost:5432/mydb?sslmode=disable")
@@ -130,12 +164,18 @@ func main() {
 
 	startupDone = true
 
-	http.HandleFunc("/health-check", livenessHandler)
+	http.HandleFunc("/liveness", livenessHandler)
 	http.HandleFunc("/readiness", readinessHandler)
 	http.HandleFunc("/startup", startupHandler)
 
+	http.HandleFunc("/test-redis", requestHandler("Redis", 10*time.Second))
+	http.HandleFunc("/test-postgre", requestHandler("PostgreSQL", 10*time.Second))
+	http.HandleFunc("/test-mongo", requestHandler("MongoDB", 10*time.Second))
+	http.HandleFunc("/test-kafka", requestHandler("Kafka", 10*time.Second))
+
 	server := &http.Server{Addr: ":8080"}
 
+	// Run HTTP server in a separate goroutine
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server failed: %v", err)
@@ -147,27 +187,19 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 
-	log.Println("Shutting down...")
+	log.Println("Shutdown initiated, blocking new requests...")
+	mutex.Lock()
+	shutdownFlag = true
+	mutex.Unlock()
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	log.Println("Waiting for ongoing requests to complete...")
+	wg.Wait()
 
-	go func() {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Fatalf("Server shutdown failed: %v", err)
-		}
-	}()
-
+	log.Println("Closing external dependencies...")
 	redisClient.Close()
 	postgresDB.Close()
-	mongoClient.Disconnect(shutdownCtx)
+	mongoClient.Disconnect(ctx)
 	kafkaProducer.Close()
 
-	<-shutdownCtx.Done()
-
-	if shutdownCtx.Err() == context.DeadlineExceeded {
-		log.Fatalln("Shutdown complete")
-	}
-
-	os.Exit(0)
+	log.Println("Shutdown complete")
 }
