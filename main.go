@@ -21,14 +21,15 @@ import (
 )
 
 var (
-	redisClient   *redis.Client
-	postgresDB    *sql.DB
-	mongoClient   *mongo.Client
-	kafkaProducer *kafka.Producer
-	startupDone   bool
-	shutdownFlag  bool
-	wg            sync.WaitGroup
-	mutex         sync.Mutex
+	redisClient    *redis.Client
+	postgresDB     *sql.DB
+	mongoClient    *mongo.Client
+	kafkaProducer  *kafka.Producer
+	startupDone    bool
+	shutdownFlag   bool
+	wg             sync.WaitGroup
+	mutex          sync.Mutex
+	activeRequests int
 )
 
 func longRunningTask(ctx context.Context, service string, duration time.Duration) {
@@ -47,10 +48,18 @@ func requestHandler(service string, duration time.Duration) http.HandlerFunc {
 			http.Error(w, "Service shutting down", http.StatusServiceUnavailable)
 			return
 		}
+		activeRequests++
+		log.Printf("New request started for %s. Active requests: %d", service, activeRequests)
 		mutex.Unlock()
 
 		ctx := r.Context()
 		longRunningTask(ctx, service, duration)
+
+		mutex.Lock()
+		activeRequests--
+		log.Printf("Request completed for %s. Active requests: %d", service, activeRequests)
+		mutex.Unlock()
+
 		w.Write([]byte(fmt.Sprintf("%s test completed", service)))
 	}
 }
@@ -100,7 +109,7 @@ func waitForDependencies(ctx context.Context, timeout time.Duration) error {
 			return nil
 		}
 
-		log.Println("Retrying in 5 seconds...") // Increase wait time
+		log.Println("Retrying in 5 seconds...")
 		time.Sleep(60 * time.Second)
 	}
 
@@ -115,6 +124,14 @@ func livenessHandler(w http.ResponseWriter, r *http.Request) {
 
 // Readiness Probe
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	if shutdownFlag {
+		mutex.Unlock()
+		http.Error(w, "Shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	mutex.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -122,18 +139,25 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	log.Println("Redis is ready")
+
 	if err := checkPostgres(ctx); err != nil {
 		http.Error(w, "Postgres unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	log.Println("PostgreSQL is ready")
+
 	if err := checkMongo(ctx); err != nil {
 		http.Error(w, "MongoDB unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	log.Println("MongoDB is ready")
+
 	if err := checkKafka(); err != nil {
 		http.Error(w, "Kafka unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	log.Println("Kafka is ready")
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
@@ -150,7 +174,7 @@ func startupHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background()) // No timeout, only cancel when all done
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	redisClient = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
@@ -193,6 +217,7 @@ func main() {
 	mutex.Unlock()
 
 	log.Println("Waiting for ongoing requests to complete...")
+	log.Printf("%d ongoing requests left", activeRequests)
 	wg.Wait()
 
 	log.Println("Closing external dependencies...")
