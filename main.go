@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -110,7 +111,7 @@ func waitForDependencies(ctx context.Context, timeout time.Duration) error {
 		}
 
 		log.Println("Retrying in 5 seconds...")
-		time.Sleep(60 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
 	return fmt.Errorf("startup dependencies not ready, exiting")
@@ -135,29 +136,41 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	var unavailable []string
+
 	if err := checkRedis(ctx); err != nil {
-		http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
-		return
+		log.Println("Redis unavailable:", err)
+		unavailable = append(unavailable, "Redis")
+	} else {
+		log.Println("Redis is ready")
 	}
-	log.Println("Redis is ready")
 
 	if err := checkPostgres(ctx); err != nil {
-		http.Error(w, "Postgres unavailable", http.StatusServiceUnavailable)
-		return
+		log.Println("PostgreSQL unavailable:", err)
+		unavailable = append(unavailable, "PostgreSQL")
+	} else {
+		log.Println("PostgreSQL is ready")
 	}
-	log.Println("PostgreSQL is ready")
 
 	if err := checkMongo(ctx); err != nil {
-		http.Error(w, "MongoDB unavailable", http.StatusServiceUnavailable)
-		return
+		log.Println("MongoDB unavailable:", err)
+		unavailable = append(unavailable, "MongoDB")
+	} else {
+		log.Println("MongoDB is ready")
 	}
-	log.Println("MongoDB is ready")
 
 	if err := checkKafka(); err != nil {
-		http.Error(w, "Kafka unavailable", http.StatusServiceUnavailable)
+		log.Println("Kafka unavailable:", err)
+		unavailable = append(unavailable, "Kafka")
+	} else {
+		log.Println("Kafka is ready")
+	}
+
+	if len(unavailable) > 0 {
+		errMsg := fmt.Sprintf("%s unavailable", strings.Join(unavailable, ", "))
+		http.Error(w, errMsg, http.StatusServiceUnavailable)
 		return
 	}
-	log.Println("Kafka is ready")
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
@@ -221,10 +234,19 @@ func main() {
 	wg.Wait()
 
 	log.Println("Closing external dependencies...")
-	redisClient.Close()
-	postgresDB.Close()
-	mongoClient.Disconnect(ctx)
-	kafkaProducer.Close()
+
+	if redisClient != nil {
+		redisClient.Close()
+	}
+	if postgresDB != nil {
+		postgresDB.Close()
+	}
+	if mongoClient != nil {
+		mongoClient.Disconnect(ctx)
+	}
+	if kafkaProducer != nil {
+		kafkaProducer.Close()
+	}
 
 	log.Println("Shutdown complete")
 }
