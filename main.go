@@ -212,41 +212,49 @@ func main() {
 
 	server := &http.Server{Addr: ":8080"}
 
-	// Run HTTP server in a separate goroutine
+	// Graceful Shutdown
+	shutdownChan := make(chan struct{})
+
+	// Menjalankan HTTP server dalam goroutine
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
 	}()
 
-	// Graceful Shutdown
+	// Menunggu sinyal untuk shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
 
-	log.Println("Shutdown initiated, blocking new requests...")
-	mutex.Lock()
-	shutdownFlag = true
-	mutex.Unlock()
+	// Menangani shutdown menggunakan channel
+	go func() {
+		<-sig
+		log.Println("Shutdown initiated, blocking new requests...")
+		mutex.Lock()
+		shutdownFlag = true
+		mutex.Unlock()
 
-	log.Println("Waiting for ongoing requests to complete...")
-	log.Printf("%d ongoing requests left", activeRequests)
-	wg.Wait()
+		log.Println("Waiting for ongoing requests to complete...")
+		wg.Wait()
 
-	log.Println("Closing external dependencies...")
+		log.Println("Closing external dependencies...")
+		if redisClient != nil {
+			redisClient.Close()
+		}
+		if postgresDB != nil {
+			postgresDB.Close()
+		}
+		if mongoClient != nil {
+			mongoClient.Disconnect(ctx)
+		}
+		if kafkaProducer != nil {
+			kafkaProducer.Close()
+		}
 
-	if redisClient != nil {
-		redisClient.Close()
-	}
-	if postgresDB != nil {
-		postgresDB.Close()
-	}
-	if mongoClient != nil {
-		mongoClient.Disconnect(ctx)
-	}
-	if kafkaProducer != nil {
-		kafkaProducer.Close()
-	}
+		log.Println("Shutdown complete")
+		close(shutdownChan) // Memberi sinyal bahwa shutdown telah selesai
+	}()
 
-	log.Println("Shutdown complete")
+	<-shutdownChan // Menunggu hingga shutdown selesai sebelum keluar program
+
 }
